@@ -1,0 +1,400 @@
+#!/usr/bin/env bash
+# ocw - run and inspect bounded OpenCode workers inside a GitHub Codespace.
+#
+# This is the Codespaces half of ocw. It owns worker lifecycle: it launches one
+# OpenCode process per named worker, keeps durable state for that worker, and
+# reports status without ever printing prompt text or credentials.
+#
+# State lives outside the repository so worker logs and prompts never become
+# product commits. Each worker gets its own OpenCode data directory so parallel
+# workers cannot block each other on one SQLite database, while still reusing
+# the Codespace's existing provider login.
+#
+# Verbs:
+#   start    launch a worker
+#   status   show one worker, or all of them
+#   logs     print the tail of a worker's raw log
+#   attach   follow a running worker's log, rendered as concise lines
+#   wait     block until a worker stops or a deadline passes
+#   stop     ask a running worker to terminate
+#   prune    delete state for workers that are no longer running
+#   bootstrap install OpenCode when missing, or upgrade it when present
+#   version  print the ocw version
+#
+# Requires: bash, python3 for `attach`, curl for `bootstrap`.
+
+set -Eeuo pipefail
+
+OCW_VERSION="1.0.0"
+
+# A Codespaces SSH command session does not export the managed repository token
+# that exists on disk. Load it here so a worker can fetch and push its own
+# branch without the token ever reaching a prompt, a log, or the console.
+if [[ -r /workspaces/.codespaces/shared/.env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source /workspaces/.codespaces/shared/.env
+  set +a
+fi
+
+STATE_ROOT="${OCW_STATE_ROOT:-$HOME/.local/state/ocw-workers}"
+OPENCODE_BIN="${OPENCODE_BIN:-$HOME/.opencode/bin/opencode}"
+PACKAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OPENCODE_INSTALL_URL="${OCW_OPENCODE_INSTALL_URL:-https://opencode.ai/install}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ocw start NAME MODEL VARIANT WORKDIR TITLE PROMPT [ATTACHMENT ...]
+  ocw status [NAME] [--json]
+  ocw logs NAME [LINES]
+  ocw attach NAME
+  ocw wait NAME [SECONDS]
+  ocw stop NAME
+  ocw prune [NAME ...]
+  ocw bootstrap [--install-only | --upgrade-only]
+  ocw version
+
+start arguments:
+  NAME        worker name, [a-zA-Z0-9._-]+
+  MODEL       provider/model, for example opencode-go/deepseek-v4.1-flash
+  VARIANT     reasoning effort, for example high or max
+  WORKDIR     an existing git worktree
+  TITLE       session title
+  PROMPT      a prompt file path, or literal prompt text when no such file exists
+  ATTACHMENT  optional file paths, attached to the message instead of pasted
+
+bootstrap installs OpenCode when it is missing and upgrades it when present.
+`ocw setup` runs it automatically, so a fresh Codespace needs no manual install.
+Use --install-only to leave a present binary alone, or --upgrade-only to refuse
+when OpenCode is missing instead of installing it.
+EOF
+}
+
+fail() {
+  printf 'ocw: %s\n' "$1" >&2
+  exit "${2:-2}"
+}
+
+opencode_version() {
+  if [[ -x "$OPENCODE_BIN" ]]; then
+    "$OPENCODE_BIN" --version 2>/dev/null || printf 'unknown'
+  else
+    printf 'not installed'
+  fi
+}
+
+# Install OpenCode when it is missing, or upgrade it when it is present.
+#
+# A Codespace starts without OpenCode, so the first run has to install it. Later
+# runs upgrade, because a worker launched against a stale binary can fail in
+# ways that look like a provider or prompt problem rather than a version problem.
+#
+# Modes:
+#   bootstrap     install when missing, upgrade when present (the default)
+#   install_only  install when missing, leave a present binary alone
+#   upgrade_only  upgrade when present, refuse when missing
+#
+# `start` uses install_only: it may install a missing binary but must not
+# surprise a caller by upgrading mid-flight.
+ensure_opencode() {
+  local mode="${1:-bootstrap}"
+  local before after
+  before="$(opencode_version)"
+
+  if [[ -x "$OPENCODE_BIN" ]]; then
+    if [[ "$mode" == "install_only" ]]; then
+      return 0
+    fi
+    printf 'opencode %s, upgrading...\n' "$before"
+    "$OPENCODE_BIN" upgrade
+  else
+    if [[ "$mode" == "upgrade_only" ]]; then
+      fail "opencode is not installed at $OPENCODE_BIN" 2
+    fi
+    command -v curl >/dev/null || fail "curl is required to install opencode from $OPENCODE_INSTALL_URL"
+    printf 'opencode not installed, installing from %s...\n' "$OPENCODE_INSTALL_URL"
+    # The official installer writes the binary to $HOME/.opencode/bin and does
+    # not modify PATH for the current session.
+    curl -fsSL "$OPENCODE_INSTALL_URL" | bash
+  fi
+
+  [[ -x "$OPENCODE_BIN" ]] ||
+    fail "opencode is still missing at $OPENCODE_BIN. Set OPENCODE_BIN to the installed path."
+  after="$(opencode_version)"
+  if [[ "$before" == "$after" ]]; then
+    printf 'opencode %s (already current)\n' "$after"
+  else
+    printf 'opencode %s -> %s\n' "$before" "$after"
+  fi
+}
+
+# Worker names become directory names, so keep them path-safe.
+require_name() {
+  [[ "$1" =~ ^[a-zA-Z0-9._-]+$ ]] || fail "invalid worker name: $1"
+}
+
+elapsed() {
+  local started="$1" now seconds
+  now="$(date +%s)"
+  seconds=$((now - started))
+  printf '%02dh:%02dm:%02ds' $((seconds / 3600)) $(((seconds % 3600) / 60)) $((seconds % 60))
+}
+
+# State is derived from the process, then the recorded exit code, so a worker
+# killed by a reboot reports STOPPED rather than a stale DONE.
+worker_state() {
+  local dir="$1" pid
+  if [[ -f "$dir/pid" ]]; then
+    pid="$(cat "$dir/pid")"
+    if kill -0 "$pid" 2>/dev/null; then
+      printf 'RUNNING'
+      return
+    fi
+  fi
+  if [[ -f "$dir/exit" ]]; then
+    if [[ "$(cat "$dir/exit")" == "0" ]]; then printf 'DONE'; else printf 'FAILED'; fi
+  else
+    printf 'STOPPED'
+  fi
+}
+
+show_one() {
+  local name="$1" dir="$STATE_ROOT/$1" state started log exit_code
+  [[ -d "$dir" ]] || { printf '%s MISSING\n' "$name"; return 1; }
+  state="$(worker_state "$dir")"
+  started="$(cat "$dir/started")"
+  exit_code="$(cat "$dir/exit" 2>/dev/null || true)"
+  printf '%-28s %-8s %s  %s/%s' \
+    "$name" "$state" "$(elapsed "$started")" "$(cat "$dir/model")" "$(cat "$dir/variant")"
+  if [[ -n "$exit_code" ]]; then
+    printf '  exit=%s' "$exit_code"
+  fi
+  printf '\n'
+  log="$dir/output.log"
+  if [[ -s "$log" ]]; then
+    tail -n 3 "$log" | sed -E 's/[[:space:]]+/ /g' | cut -c1-240 | sed 's/^/  /'
+  fi
+}
+
+start_worker() {
+  [[ $# -ge 6 ]] || { usage >&2; exit 2; }
+  local name="$1" model="$2" variant="$3" workdir="$4" title="$5" prompt="$6"
+  shift 6
+
+  local dir pid runner attachment attachment_name attachment_index default_auth_file
+  require_name "$name"
+  [[ "$model" == */* ]] || fail "MODEL must be provider/model, got: $model"
+  # A fresh Codespace has no OpenCode, so install it rather than failing the
+  # first start with a confusing "not executable" error.
+  if [[ ! -x "$OPENCODE_BIN" ]]; then
+    ensure_opencode install_only
+  fi
+  [[ -x "$OPENCODE_BIN" ]] || fail "opencode is not executable: $OPENCODE_BIN"
+  [[ -d "$workdir/.git" || -f "$workdir/.git" ]] || fail "not a git worktree: $workdir"
+
+  dir="$STATE_ROOT/$name"
+  if [[ -d "$dir" && "$(worker_state "$dir")" == "RUNNING" ]]; then
+    fail "worker already running: $name" 1
+  fi
+
+  # A worker directory is rebuilt on every start, so a rerun never inherits a
+  # previous exit code, attachment set, or prompt.
+  rm -rf "$dir"
+  mkdir -p "$dir/attachments" "$dir/xdg-data/opencode"
+
+  # Accept either a prompt file or literal text. Testing for a readable file
+  # first keeps the common case (a prepared prompt file) unambiguous.
+  if [[ -s "$prompt" && -f "$prompt" ]]; then
+    cp "$prompt" "$dir/prompt.md"
+  else
+    printf '%s\n' "$prompt" > "$dir/prompt.md"
+  fi
+  [[ -s "$dir/prompt.md" ]] || fail "prompt is empty"
+
+  # OpenCode keeps its SQLite database beside provider authentication in the
+  # XDG data directory. Give each worker a private database so parallel workers
+  # cannot contend, and symlink only the shared login.
+  default_auth_file="${XDG_DATA_HOME:-$HOME/.local/share}/opencode/auth.json"
+  if [[ -f "$default_auth_file" ]]; then
+    ln -s "$default_auth_file" "$dir/xdg-data/opencode/auth.json"
+  fi
+
+  attachment_index=0
+  for attachment in "$@"; do
+    [[ -f "$attachment" ]] || fail "attachment is missing or not a file: $attachment"
+    attachment_name="$(printf '%03d-%s' "$attachment_index" "$(basename "$attachment")")"
+    cp -- "$attachment" "$dir/attachments/$attachment_name"
+    attachment_index=$((attachment_index + 1))
+  done
+
+  printf '%s' "$(date +%s)" > "$dir/started"
+  printf '%s' "$model" > "$dir/model"
+  printf '%s' "$variant" > "$dir/variant"
+  printf '%s' "$workdir" > "$dir/workdir"
+  printf '%s' "$title" > "$dir/title"
+
+  # The runner is written to the state directory rather than the package so a
+  # read-only checkout, or a symlinked package, still works.
+  runner="$dir/runner.sh"
+  cat > "$runner" <<'RUNNER'
+#!/usr/bin/env bash
+set +e
+args=(run --pure --format json --model "$MODEL" --variant "$VARIANT" --dir "$WORKDIR" --title "$TITLE" --auto)
+if [[ -d "$ATTACHMENT_DIR" ]]; then
+  while IFS= read -r -d '' attachment; do
+    args+=(-f "$attachment")
+  done < <(find "$ATTACHMENT_DIR" -maxdepth 1 -type f -print0 | sort -z)
+fi
+args+=("$(cat "$PROMPT_FILE")")
+"$OPENCODE_BIN" "${args[@]}" > "$OUTPUT_FILE" 2>&1
+code=$?
+printf '%s' "$code" > "$EXIT_FILE"
+exit "$code"
+RUNNER
+  chmod 700 "$runner"
+
+  nohup env \
+    XDG_DATA_HOME="$dir/xdg-data" \
+    OPENCODE_BIN="$OPENCODE_BIN" \
+    MODEL="$model" \
+    VARIANT="$variant" \
+    WORKDIR="$workdir" \
+    TITLE="$title" \
+    PROMPT_FILE="$dir/prompt.md" \
+    ATTACHMENT_DIR="$dir/attachments" \
+    OUTPUT_FILE="$dir/output.log" \
+    EXIT_FILE="$dir/exit" \
+    bash "$runner" >/dev/null 2>&1 &
+  pid=$!
+  printf '%s' "$pid" > "$dir/pid"
+  printf '%s started pid=%s\n' "$name" "$pid"
+}
+
+case "${1:-}" in
+  start)
+    shift
+    start_worker "$@"
+    ;;
+
+  status|ls)
+    shift
+    json=0
+    name=""
+    for arg in "$@"; do
+      case "$arg" in
+        --json) json=1 ;;
+        *) name="$arg" ;;
+      esac
+    done
+    if [[ "$json" == 1 ]]; then
+      # Machine-readable output reuses the same snapshot reader the dashboard
+      # uses, so both surfaces always agree on state.
+      exec python3 "$PACKAGE_ROOT/worker-snapshot.py"
+    fi
+    if [[ -n "$name" ]]; then
+      require_name "$name"
+      show_one "$name"
+    else
+      found=0
+      for dir in "$STATE_ROOT"/*; do
+        [[ -d "$dir" ]] || continue
+        found=1
+        show_one "$(basename "$dir")" || true
+      done
+      [[ "$found" == 1 ]] || printf 'No workers.\n'
+    fi
+    ;;
+
+  logs)
+    [[ $# -ge 2 && $# -le 3 ]] || { usage >&2; exit 2; }
+    require_name "$2"
+    tail -n "${3:-20}" "$STATE_ROOT/$2/output.log"
+    ;;
+
+  attach)
+    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    require_name "$2"
+    log="$STATE_ROOT/$2/output.log"
+    [[ -f "$log" ]] || fail "no log for worker: $2" 1
+    # Replay from the start, then follow, rendering concise lines so the raw
+    # JSONL never floods the caller's terminal.
+    tail -n +1 -f "$log" | python3 "$PACKAGE_ROOT/worker-snapshot.py" --stream
+    ;;
+
+  wait)
+    [[ $# -ge 2 && $# -le 3 ]] || { usage >&2; exit 2; }
+    require_name "$2"
+    deadline=$(( $(date +%s) + ${3:-3600} ))
+    while [[ "$(worker_state "$STATE_ROOT/$2")" == "RUNNING" && $(date +%s) -lt $deadline ]]; do
+      sleep 10
+    done
+    show_one "$2"
+    # A worker that failed should fail the wait, so callers can branch on it.
+    if [[ "$(worker_state "$STATE_ROOT/$2")" == "FAILED" ]]; then
+      exit 1
+    fi
+    exit 0
+    ;;
+
+  stop)
+    [[ $# -eq 2 ]] || { usage >&2; exit 2; }
+    require_name "$2"
+    dir="$STATE_ROOT/$2"
+    [[ -f "$dir/pid" ]] || fail "worker not found: $2" 1
+    kill -TERM "$(cat "$dir/pid")" 2>/dev/null || true
+    printf '%s stop requested\n' "$2"
+    ;;
+
+  prune)
+    shift
+    removed=0
+    candidates=()
+    if [[ $# -gt 0 ]]; then
+      for name in "$@"; do
+        require_name "$name"
+        candidates+=("$name")
+      done
+    else
+      for dir in "$STATE_ROOT"/*; do
+        [[ -d "$dir" ]] || continue
+        candidates+=("$(basename "$dir")")
+      done
+    fi
+    for name in ${candidates+"${candidates[@]}"}; do
+      dir="$STATE_ROOT/$name"
+      [[ -d "$dir" ]] || continue
+      if [[ "$(worker_state "$dir")" == "RUNNING" ]]; then
+        printf '%s skipped (running)\n' "$name"
+        continue
+      fi
+      rm -rf "$dir"
+      printf '%s pruned\n' "$name"
+      removed=$((removed + 1))
+    done
+    [[ "$removed" -gt 0 ]] || printf 'Nothing to prune.\n'
+    ;;
+
+  version)
+    printf 'ocw %s\n' "$OCW_VERSION"
+    ;;
+
+  bootstrap)
+    shift
+    case "${1:-}" in
+      '') ensure_opencode bootstrap ;;
+      --install-only) ensure_opencode install_only ;;
+      --upgrade-only) ensure_opencode upgrade_only ;;
+      *) fail "unknown bootstrap option: $1" ;;
+    esac
+    ;;
+
+  help|-h|--help)
+    usage
+    ;;
+
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

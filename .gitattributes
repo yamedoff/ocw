@@ -1,0 +1,13 @@
+# The remote half runs on Linux inside a Codespace, so shell and Python files
+# must keep LF endings no matter what the authoring machine's Git config says.
+# A CRLF shebang fails with "bad interpreter", which is confusing to diagnose.
+* text=auto eol=lf
+
+# PowerShell is authored and run on Windows.
+*.ps1 text eol=crlf
+
+# Never rewrite binary files.
+*.png binary
+*.jpg binary
+*.gz  binary
+*.tar binary

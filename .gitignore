@@ -1,0 +1,12 @@
+# Local dashboard cache: per-Codespace snapshots, machine-specific.
+local/.cache/
+
+# Python bytecode from running the snapshot reader.
+__pycache__/
+*.pyc
+
+# Local editor and OS noise.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
