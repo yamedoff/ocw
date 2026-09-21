@@ -63,7 +63,11 @@ $RemoteRoot = if ($RemoteRoot) { $RemoteRoot }
               elseif ($env:OCW_REMOTE_ROOT) { $env:OCW_REMOTE_ROOT }
               else { '/home/codespace/remote-package' }
 $CacheRoot = Join-Path $LocalRoot '.cache'
-$Rest = @($Rest)
+# ValueFromRemainingArguments yields a null or a single empty string when no
+# extra arguments were supplied. Both would be forwarded into a [string[]]
+# parameter and fail as "an empty string". Note that `$_ -ne ''` is not enough
+# here: in PowerShell, `$null -ne ''` is true, so null would survive the filter.
+$Rest = @($Rest | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 
 function Get-CodespaceList {
     <# List Codespaces once, so Codespace resolution and the dashboard agree. #>
@@ -100,15 +104,44 @@ function Quote-RemoteArg {
 }
 
 function Invoke-Remote {
-    <# Run `ocw VERB ARGS...` inside the Codespace and stream its output back. #>
+    <#
+    Run `ocw VERB ARGS...` inside the Codespace, stream its output, and return
+    only the exit code.
+
+    The output goes to the host rather than the pipeline on purpose: if it were
+    left on the success stream, a caller capturing the return value would get
+    the output lines *and* the exit code as one array, and any comparison
+    against that array silently misbehaves.
+    #>
     param(
         [Parameter(Mandatory)][string]$Target,
-        [Parameter(Mandatory)][string[]]$Arguments
+        [Parameter(Mandatory)][string[]]$Arguments,
+
+        # Stream output live instead of capturing it. Required for verbs that
+        # never terminate, such as `attach`.
+        [switch]$Stream
     )
-    $command = "$RemoteRoot/ocw " +
-               (($Arguments | ForEach-Object { Quote-RemoteArg $_ }) -join ' ')
-    & gh codespace ssh -c $Target -- $command
-    return $LASTEXITCODE
+    $quoted = ($Arguments | ForEach-Object { Quote-RemoteArg $_ }) -join ' '
+
+    if ($Stream) {
+        & gh codespace ssh -c $Target -- "$RemoteRoot/ocw $quoted" | Out-Host
+        return $LASTEXITCODE
+    }
+
+    # `gh codespace ssh` collapses every remote failure to exit 1, so the remote
+    # status is echoed as a marker and parsed back out. Without this a usage
+    # error (2) and a worker failure (1) are indistinguishable to a caller.
+    $command = "$RemoteRoot/ocw $quoted; printf 'OCW_EXIT=%s\n' `$?"
+    $output = & gh codespace ssh -c $Target -- $command 2>&1
+    $code = $LASTEXITCODE
+    foreach ($line in $output) {
+        if ($line -is [string] -and $line -match '^OCW_EXIT=(\d+)$') {
+            $code = [int]$Matches[1]
+            continue
+        }
+        Write-Host $line
+    }
+    return $code
 }
 
 function Invoke-Setup {
@@ -126,14 +159,30 @@ function Invoke-Setup {
     }
 
     $tarPath = Join-Path ([IO.Path]::GetTempPath()) ("ocw-remote-{0}.tar.gz" -f $PID)
+    # Absolute and PID-suffixed: a bare relative name is written with the
+    # surrounding quotes as part of the file name, and a fixed name would
+    # collide between concurrent installs.
+    $remoteTar = "/tmp/ocw-remote-$PID.tar.gz"
     try {
-        & tar -czf $tarPath -C $remote .
+        # Package the working tree, but never ship local build junk. A stray
+        # __pycache__ or .cache directory would otherwise be installed into the
+        # Codespace, where it is invisible but confusing.
+        & tar -czf $tarPath -C $remote `
+            --exclude=__pycache__ --exclude=.cache --exclude=*.pyc `
+            --exclude=.git .
         if ($LASTEXITCODE -ne 0) { throw 'tar failed while packaging the remote payload.' }
 
-        $encoded = [Convert]::ToBase64String([IO.File]::ReadAllBytes($tarPath))
-        $command = "mkdir -p $RemoteRoot && base64 -d | tar -xzf - -C $RemoteRoot && " +
+        # Copy the archive with `gh codespace cp` rather than piping it through
+        # the shell. A binary archive cannot survive shell quoting or text
+        # encoding, and base64 over a PowerShell pipeline is not binary-safe.
+        & gh codespace cp -c $Target -e $tarPath "remote:$remoteTar"
+        if ($LASTEXITCODE -ne 0) { throw 'Copying the remote payload failed.' }
+
+        $command = "mkdir -p $RemoteRoot && " +
+                   "tar -xzf $remoteTar -C $RemoteRoot && " +
+                   "rm -f $remoteTar && " +
                    "chmod +x $RemoteRoot/ocw $RemoteRoot/setup-worktrees.sh"
-        $encoded | & gh codespace ssh -c $Target -- $command
+        & gh codespace ssh -c $Target -- $command
         if ($LASTEXITCODE -ne 0) { throw 'Remote install failed.' }
 
         Write-Host "ocw installed into $Target at $RemoteRoot"
@@ -271,13 +320,22 @@ switch ($Verb) {
         }
     }
 
+    'attach' {
+        # Follows a live log, so it must stream rather than be captured.
+        $target = Resolve-Codespace
+        exit (Invoke-Remote -Target $target -Arguments (@('attach') + $Rest) -Stream)
+    }
+
     default {
         $known = @('start', 'logs', 'attach', 'wait', 'stop', 'prune',
                    'bootstrap', 'version')
         if ($Verb -notin $known) {
-            Write-Error ("Unknown verb '$Verb'. Known: setup, start, status, logs, " +
-                         "attach, wait, stop, prune, bootstrap, dashboard, " +
-                         "codespaces, version.")
+            # Written to stderr directly rather than via Write-Error, which
+            # would throw under $ErrorActionPreference='Stop' and exit 1
+            # instead of the intended usage-error code.
+            [Console]::Error.WriteLine(
+                "ocw: unknown verb '$Verb'. Known: setup, start, status, logs, " +
+                "attach, wait, stop, prune, bootstrap, dashboard, codespaces, version.")
             exit 2
         }
         $target = Resolve-Codespace
