@@ -317,9 +317,14 @@ case "${1:-}" in
     require_name "$2"
     log="$STATE_ROOT/$2/output.log"
     [[ -f "$log" ]] || fail "no log for worker: $2" 1
-    # Replay from the start, then follow, rendering concise lines so the raw
-    # JSONL never floods the caller's terminal.
-    tail -n +1 -f "$log" | python3 "$PACKAGE_ROOT/worker-snapshot.py" --stream
+    # Replay from the start, rendering concise lines so the raw JSONL never
+    # floods the caller's terminal. Only follow a worker that can still write:
+    # following a finished log would hang forever on a file that never grows.
+    if [[ "$(worker_state "$STATE_ROOT/$2")" == "RUNNING" ]]; then
+      tail -n +1 -f "$log" | python3 "$PACKAGE_ROOT/worker-snapshot.py" --stream
+    else
+      tail -n +1 "$log" | python3 "$PACKAGE_ROOT/worker-snapshot.py" --stream
+    fi
     ;;
 
   wait)

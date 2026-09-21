@@ -7,12 +7,17 @@
 #
 # Usage:
 #   setup-worktrees.sh REPOSITORY WORKTREE_ROOT BRANCH[=DIRECTORY]...
-#   setup-worktrees.sh REPOSITORY WORKTREE_ROOT --link NAME=PATH BRANCH...
+#   setup-worktrees.sh REPOSITORY WORKTREE_ROOT [--link NAME=PATH] [--base REF] BRANCH...
 #
 # --link symlinks a shared directory into every worktree, which is how a repo
 # keeps one orchestration folder (prompts, run logs) visible from each lane
 # without committing it. The name is added to the repository's local git
 # exclude file so it never shows up as an untracked change.
+#
+# A branch that exists locally is reused, one that exists only on origin is
+# tracked, and a branch that exists nowhere is created from --base (default:
+# the repository's current HEAD). Without that last case a fresh lane could not
+# be created until its branch had been pushed, which is backwards.
 
 set -Eeuo pipefail
 
@@ -26,6 +31,7 @@ if [[ -r /workspaces/.codespaces/shared/.env ]]; then
 fi
 
 links=()
+base=""
 positional=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -38,6 +44,15 @@ while [[ $# -gt 0 ]]; do
       links+=("${1#--link=}")
       shift
       ;;
+    --base)
+      [[ $# -ge 2 ]] || { printf 'setup-worktrees: --base needs a git ref\n' >&2; exit 2; }
+      base="$2"
+      shift 2
+      ;;
+    --base=*)
+      base="${1#--base=}"
+      shift
+      ;;
     *)
       positional+=("$1")
       shift
@@ -46,7 +61,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${#positional[@]} -lt 3 ]]; then
-  printf 'Usage: setup-worktrees.sh REPOSITORY WORKTREE_ROOT BRANCH[=DIRECTORY]... [--link NAME=PATH]\n' >&2
+  printf 'Usage: setup-worktrees.sh REPOSITORY WORKTREE_ROOT [--link NAME=PATH] [--base REF] BRANCH[=DIRECTORY]...\n' >&2
   exit 2
 fi
 
@@ -84,8 +99,10 @@ for specification in "${branches[@]}"; do
   if [[ ! -e "$destination/.git" ]]; then
     if git -C "$repository" show-ref --verify --quiet "refs/heads/$branch"; then
       git -C "$repository" worktree add "$destination" "$branch"
-    else
+    elif git -C "$repository" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
       git -C "$repository" worktree add --track -b "$branch" "$destination" "origin/$branch"
+    else
+      git -C "$repository" worktree add -b "$branch" "$destination" "${base:-HEAD}"
     fi
   fi
 
