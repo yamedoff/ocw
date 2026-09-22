@@ -65,6 +65,37 @@ Run `bootstrap` on its own whenever you want to refresh the binary:
 `start` installs a missing binary but never upgrades mid-flight, so a run is not
 surprised by a version change.
 
+## Release channels
+
+By default `ocw` uses OpenCode's stable line, installed from the official script
+and upgraded through GitHub releases.
+
+OpenCode's next major line is developed on a `v2` branch and published only to
+the npm `dev` dist-tag as `0.0.0-dev-<timestamp>` snapshots. It has no GitHub
+release and no `2.x` version on npm, so `opencode upgrade` cannot see it at all.
+Select the channel to use it:
+
+```powershell
+./local/ocw.ps1 -Channel dev bootstrap     # install or refresh the v2 snapshot
+./local/ocw.ps1 -Channel dev start lane-a opencode-go/deepseek-v4.1-flash high `
+    /workspaces/worktrees/lane-a "lane a" ./prompt-lane-a.md
+```
+
+Set `OCW_OPENCODE_CHANNEL=dev` to make the channel persistent for a session
+instead of passing `-Channel` on every call.
+
+A channel installs into its own prefix, `~/.local/share/ocw/opencode/<channel>`,
+so it never overwrites the stable binary and a broken channel build cannot take
+a working install down with it. Both can coexist:
+
+```
+~/.opencode/bin/opencode                         stable
+~/.local/share/ocw/opencode/dev/bin/opencode     v2 snapshots
+```
+
+The `dev` tag is a development build and moves without notice, so verify the
+version after a refresh if you need to know exactly what you are running.
+
 If you only have one Codespace, you can skip `-Codespace` everywhere. Otherwise
 set it once per shell:
 

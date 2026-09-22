@@ -32,6 +32,8 @@ Verbs:
   ./ocw.ps1 start lane-a opencode-go/deepseek-v4.1-flash high /workspaces/worktrees/lane-a lane-a ./prompt-lane-a.md
 .EXAMPLE
   ./ocw.ps1 -Codespace my-codespace attach lane-a
+.EXAMPLE
+  ./ocw.ps1 -Codespace my-codespace -Channel dev bootstrap   # OpenCode v2 snapshots
 #>
 [CmdletBinding()]
 param(
@@ -51,6 +53,10 @@ param(
     # status: request machine-readable JSON instead of a table.
     [switch]$Json,
 
+    # OpenCode release channel, for example 'dev' for the v2 snapshots.
+    # Empty installs and upgrades the stable line from GitHub releases.
+    [string]$Channel,
+
     # dashboard: refresh continuously instead of rendering once.
     [switch]$Watch
 )
@@ -68,6 +74,10 @@ $CacheRoot = Join-Path $LocalRoot '.cache'
 # parameter and fail as "an empty string". Note that `$_ -ne ''` is not enough
 # here: in PowerShell, `$null -ne ''` is true, so null would survive the filter.
 $Rest = @($Rest | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+# Selects the OpenCode release channel for the remote half. Passed as an
+# environment prefix so it applies to the one command, not the whole session.
+$ChannelPrefix = if ($Channel) { "OCW_OPENCODE_CHANNEL=$Channel " } else { '' }
 
 function Get-CodespaceList {
     <# List Codespaces once, so Codespace resolution and the dashboard agree. #>
@@ -124,14 +134,14 @@ function Invoke-Remote {
     $quoted = ($Arguments | ForEach-Object { Quote-RemoteArg $_ }) -join ' '
 
     if ($Stream) {
-        & gh codespace ssh -c $Target -- "$RemoteRoot/ocw $quoted" | Out-Host
+        & gh codespace ssh -c $Target -- "$ChannelPrefix$RemoteRoot/ocw $quoted" | Out-Host
         return $LASTEXITCODE
     }
 
     # `gh codespace ssh` collapses every remote failure to exit 1, so the remote
     # status is echoed as a marker and parsed back out. Without this a usage
     # error (2) and a worker failure (1) are indistinguishable to a caller.
-    $command = "$RemoteRoot/ocw $quoted; printf 'OCW_EXIT=%s\n' `$?"
+    $command = "$ChannelPrefix$RemoteRoot/ocw $quoted; printf 'OCW_EXIT=%s\n' `$?"
     $output = & gh codespace ssh -c $Target -- $command 2>&1
     $code = $LASTEXITCODE
     foreach ($line in $output) {

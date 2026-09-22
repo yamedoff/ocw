@@ -139,5 +139,24 @@ check 'restart reuses the worker name' '0' \
 check 'restart replaces the stored prompt' 'second run' \
   "$(cat "$OCW_STATE_ROOT/e2e-lane/prompt.md")"
 
+echo 'opencode release channel'
+check 'unknown bootstrap option exits 2' '2' \
+  "$(bash "$OCW" bootstrap --nope >/dev/null 2>&1; echo $?)"
+check '--channel without a name exits 2' '2' \
+  "$(bash "$OCW" bootstrap --channel >/dev/null 2>&1; echo $?)"
+
+# A channel installs into its own prefix. Staging a stand-in binary there proves
+# resolution and the runner wiring without touching npm or the network.
+mkdir -p "$WORK/ch/dev/bin"
+cp "$WORK/bin/opencode" "$WORK/ch/dev/bin/opencode"
+chmod +x "$WORK/ch/dev/bin/opencode"
+check 'channel install-only is a no-op when present' '0' \
+  "$(OCW_OPENCODE_CHANNEL_ROOT="$WORK/ch" bash "$OCW" bootstrap --channel dev --install-only >/dev/null 2>&1; echo $?)"
+check 'channel binary starts a worker' '0' \
+  "$(OCW_OPENCODE_CHANNEL_ROOT="$WORK/ch" OCW_OPENCODE_CHANNEL=dev bash "$OCW" start ch-lane \
+     opencode-go/x high "$WORK/repo" 'channel lane' 'channel run' >/dev/null 2>&1; echo $?)"
+check 'channel worker reaches DONE' 'DONE' \
+  "$(bash "$OCW" wait ch-lane 30 | awk '{print $2}')"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

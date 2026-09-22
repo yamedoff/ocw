@@ -42,6 +42,32 @@ OPENCODE_BIN="${OPENCODE_BIN:-$HOME/.opencode/bin/opencode}"
 PACKAGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPENCODE_INSTALL_URL="${OCW_OPENCODE_INSTALL_URL:-https://opencode.ai/install}"
 
+# Release channel for OpenCode itself.
+#
+# Empty means the stable line, installed from the official script and upgraded
+# with `opencode upgrade`, which reads GitHub releases.
+#
+# A non-empty channel installs the matching npm dist-tag into its own prefix
+# instead. That is the only way to reach the v2 line: v2 is developed on a `v2`
+# branch and published to the npm `dev` tag as 0.0.0-dev-<timestamp> snapshots.
+# It has no GitHub release and no 2.x version on npm, so `opencode upgrade`
+# cannot see it at all, and the stable installer would silently keep v1.
+#
+# Example: OCW_OPENCODE_CHANNEL=dev
+OPENCODE_CHANNEL="${OCW_OPENCODE_CHANNEL:-}"
+OPENCODE_CHANNEL_ROOT="${OCW_OPENCODE_CHANNEL_ROOT:-$HOME/.local/share/ocw/opencode}"
+
+# The binary for the configured channel. A channel install is isolated under
+# its own prefix so switching channels never overwrites the stable binary, and
+# so a broken channel build cannot take the working one down with it.
+opencode_binary() {
+  if [[ -n "$OPENCODE_CHANNEL" ]]; then
+    printf '%s/%s/bin/opencode' "$OPENCODE_CHANNEL_ROOT" "$OPENCODE_CHANNEL"
+  else
+    printf '%s' "$OPENCODE_BIN"
+  fi
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -52,7 +78,7 @@ Usage:
   ocw wait NAME [SECONDS]
   ocw stop NAME
   ocw prune [NAME ...]
-  ocw bootstrap [--install-only | --upgrade-only]
+  ocw bootstrap [--install-only | --upgrade-only | --channel NAME]
   ocw version
 
 start arguments:
@@ -68,6 +94,11 @@ bootstrap installs OpenCode when it is missing and upgrades it when present.
 `ocw setup` runs it automatically, so a fresh Codespace needs no manual install.
 Use --install-only to leave a present binary alone, or --upgrade-only to refuse
 when OpenCode is missing instead of installing it.
+
+--channel NAME installs the npm dist-tag NAME instead of the stable line, for
+example --channel dev for the v2 snapshots. A channel install lives in its own
+prefix, so switching channels never overwrites the stable binary. Select a
+channel persistently with OCW_OPENCODE_CHANNEL.
 EOF
 }
 
@@ -77,8 +108,10 @@ fail() {
 }
 
 opencode_version() {
-  if [[ -x "$OPENCODE_BIN" ]]; then
-    "$OPENCODE_BIN" --version 2>/dev/null || printf 'unknown'
+  local binary
+  binary="$(opencode_binary)"
+  if [[ -x "$binary" ]]; then
+    "$binary" --version 2>/dev/null || printf 'unknown'
   else
     printf 'not installed'
   fi
@@ -99,18 +132,38 @@ opencode_version() {
 # surprise a caller by upgrading mid-flight.
 ensure_opencode() {
   local mode="${1:-bootstrap}"
-  local before after
+  local before after binary
+  binary="$(opencode_binary)"
   before="$(opencode_version)"
 
-  if [[ -x "$OPENCODE_BIN" ]]; then
+  # A channel install cannot be upgraded by `opencode upgrade`, which only reads
+  # GitHub releases. It is refreshed by reinstalling the dist-tag instead.
+  if [[ -n "$OPENCODE_CHANNEL" ]]; then
+    if [[ -x "$binary" && "$mode" == "install_only" ]]; then
+      return 0
+    fi
+    command -v npm >/dev/null ||
+      fail "npm is required to install the '$OPENCODE_CHANNEL' channel of opencode"
+    printf 'installing opencode-ai@%s into %s...\n' "$OPENCODE_CHANNEL" "$OPENCODE_CHANNEL_ROOT/$OPENCODE_CHANNEL"
+    mkdir -p "$OPENCODE_CHANNEL_ROOT/$OPENCODE_CHANNEL"
+    npm install --global --prefix "$OPENCODE_CHANNEL_ROOT/$OPENCODE_CHANNEL" \
+      "opencode-ai@$OPENCODE_CHANNEL" --no-fund --no-audit --loglevel=error
+    [[ -x "$binary" ]] ||
+      fail "channel install finished but no binary appeared at $binary"
+    printf 'opencode %s -> %s (channel %s)\n' \
+      "$before" "$(opencode_version)" "$OPENCODE_CHANNEL"
+    return 0
+  fi
+
+  if [[ -x "$binary" ]]; then
     if [[ "$mode" == "install_only" ]]; then
       return 0
     fi
     printf 'opencode %s, upgrading...\n' "$before"
-    "$OPENCODE_BIN" upgrade
+    "$binary" upgrade
   else
     if [[ "$mode" == "upgrade_only" ]]; then
-      fail "opencode is not installed at $OPENCODE_BIN" 2
+      fail "opencode is not installed at $binary" 2
     fi
     command -v curl >/dev/null || fail "curl is required to install opencode from $OPENCODE_INSTALL_URL"
     printf 'opencode not installed, installing from %s...\n' "$OPENCODE_INSTALL_URL"
@@ -119,8 +172,8 @@ ensure_opencode() {
     curl -fsSL "$OPENCODE_INSTALL_URL" | bash
   fi
 
-  [[ -x "$OPENCODE_BIN" ]] ||
-    fail "opencode is still missing at $OPENCODE_BIN. Set OPENCODE_BIN to the installed path."
+  [[ -x "$binary" ]] ||
+    fail "opencode is still missing at $binary. Set OPENCODE_BIN to the installed path."
   after="$(opencode_version)"
   if [[ "$before" == "$after" ]]; then
     printf 'opencode %s (already current)\n' "$after"
@@ -182,15 +235,17 @@ start_worker() {
   local name="$1" model="$2" variant="$3" workdir="$4" title="$5" prompt="$6"
   shift 6
 
-  local dir pid runner attachment attachment_name attachment_index default_auth_file
+  local dir pid runner attachment attachment_name attachment_index default_auth_file binary
   require_name "$name"
   [[ "$model" == */* ]] || fail "MODEL must be provider/model, got: $model"
   # A fresh Codespace has no OpenCode, so install it rather than failing the
   # first start with a confusing "not executable" error.
-  if [[ ! -x "$OPENCODE_BIN" ]]; then
+  binary="$(opencode_binary)"
+  if [[ ! -x "$binary" ]]; then
     ensure_opencode install_only
+    binary="$(opencode_binary)"
   fi
-  [[ -x "$OPENCODE_BIN" ]] || fail "opencode is not executable: $OPENCODE_BIN"
+  [[ -x "$binary" ]] || fail "opencode is not executable: $binary"
   [[ -d "$workdir/.git" || -f "$workdir/.git" ]] || fail "not a git worktree: $workdir"
 
   dir="$STATE_ROOT/$name"
@@ -256,7 +311,7 @@ RUNNER
 
   nohup env \
     XDG_DATA_HOME="$dir/xdg-data" \
-    OPENCODE_BIN="$OPENCODE_BIN" \
+    OPENCODE_BIN="$binary" \
     MODEL="$model" \
     VARIANT="$variant" \
     WORKDIR="$workdir" \
@@ -386,12 +441,23 @@ case "${1:-}" in
 
   bootstrap)
     shift
-    case "${1:-}" in
-      '') ensure_opencode bootstrap ;;
-      --install-only) ensure_opencode install_only ;;
-      --upgrade-only) ensure_opencode upgrade_only ;;
-      *) fail "unknown bootstrap option: $1" ;;
-    esac
+    # Options combine, for example: bootstrap --channel dev --install-only
+    mode="bootstrap"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --install-only) mode="install_only" ;;
+        --upgrade-only) mode="upgrade_only" ;;
+        --channel)
+          [[ $# -ge 2 ]] || fail "--channel needs a dist-tag name, for example dev"
+          OPENCODE_CHANNEL="$2"
+          shift
+          ;;
+        --channel=*) OPENCODE_CHANNEL="${1#--channel=}" ;;
+        *) fail "unknown bootstrap option: $1" ;;
+      esac
+      shift
+    done
+    ensure_opencode "$mode"
     ;;
 
   help|-h|--help)
